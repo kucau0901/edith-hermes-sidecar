@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Cerap audio sidecar for Hermes.
+"""Hermes access sidecar — a universal HTTP shim for a Hermes install's own engines.
 
-Exposes OpenAI-style HTTP audio endpoints that reuse THIS Hermes install's own
-STT/TTS engines, so an external app (Cerap) can do speech-to-text and
-text-to-speech on the user's own Hermes:
+Exposes OpenAI-style HTTP endpoints that reuse THIS Hermes install's own STT/TTS
+engines (and, opt-in, forward chat), so ANY external client — Cerap, EDITH, or your
+own app — can do speech + chat against the user's own Hermes over one base URL:
 
-  * ``POST /v1/audio/transcriptions``  (STT)  multipart ``file`` -> ``{"text": ...}``
-  * ``POST /v1/audio/speech``          (TTS)  JSON ``{input,...}`` -> audio bytes
+  * ``POST /v1/audio/transcriptions``  (STT)   multipart ``file`` -> ``{"text": ...}``
+  * ``POST /v1/audio/speech``          (TTS)   JSON ``{input,...}`` -> audio bytes
+  * ``POST /v1/chat/completions``      (chat)  opt-in reverse-proxy (HERMES_CHAT_UPSTREAM)
+  * ``GET  /v1/models``                (chat)  opt-in reverse-proxy
   * ``GET  /health``                   liveness (no auth)
 
 Why a sidecar (not a core patch): Hermes's tunneled ``api_server`` is text+image
@@ -15,7 +17,7 @@ process imports those exact engines (``tools.transcription_tools.transcribe_audi
 and ``tools.tts_tool.text_to_speech_tool``) and serves them over HTTP, **without
 modifying Hermes source** (update-safe). The user's own provider config
 (``stt.provider`` / ``tts.provider`` in ``~/.hermes/config.yaml``) does the work,
-so Cerap pays nothing and audio never leaves the box.
+so the client pays nothing and audio never leaves the box.
 
 Auth: same ``API_SERVER_KEY`` bearer as the Hermes api_server (constant-time
 check), so a client uses ONE token for chat (8642) and audio (this sidecar).
@@ -45,16 +47,24 @@ from aiohttp import web  # noqa: E402
 from tools.transcription_tools import transcribe_audio  # noqa: E402
 from tools.tts_tool import text_to_speech_tool  # noqa: E402
 
-log = logging.getLogger("cerap-audio-sidecar")
+log = logging.getLogger("hermes-audio-sidecar")
 
-PORT = int(os.environ.get("CERAP_AUDIO_PORT", "8643"))
-# Optional reverse-proxy. When set (e.g. "http://127.0.0.1:8642"), any request that is NOT /health or
-# /v1/audio/* is forwarded to this Hermes api_server — so a single-base-URL client (EDITH over
-# Tailscale, with no Cloudflare path-routing) can reach chat AND audio through this ONE port. OFF by
-# default → behaviour is byte-for-byte the audio-only sidecar Cerap already runs (Cerap never hits
-# the proxy: Cloudflare routes its chat straight to :8642).
+# Port. New HERMES_* name is preferred; the old CERAP_AUDIO_PORT is kept as a fallback so the ~1000
+# already-deployed launchd/systemd units (which bake CERAP_AUDIO_PORT) keep binding the right port
+# untouched after this rebrand.
+PORT = int(os.environ.get("HERMES_AUDIO_PORT") or os.environ.get("CERAP_AUDIO_PORT") or "8643")
+# Bind host. Default 0.0.0.0 = reachable over the network — devices, other boxes, and glasses reach
+# this sidecar REMOTELY, so narrowing to loopback would break them (and every Cerap/EDITH user running
+# their own). An operator MAY opt in to 127.0.0.1 ONLY when the sidecar is fronted by a same-box tunnel
+# (cloudflared / `tailscale serve`), which then authenticates in front. No existing install sets this,
+# so every current deployment stays 0.0.0.0 exactly as before.
+BIND = os.environ.get("HERMES_AUDIO_BIND", "0.0.0.0").strip() or "0.0.0.0"
+# Optional reverse-proxy. When set (e.g. "http://127.0.0.1:8642"), the allowlisted chat paths are
+# forwarded to this Hermes api_server — so a single-base-URL client (e.g. EDITH over Tailscale, with no
+# Cloudflare path-routing) can reach chat AND audio through this ONE port. OFF by default → an
+# audio-only client (e.g. Cerap, which routes its chat straight to :8642) never hits the proxy.
 CHAT_UPSTREAM = os.environ.get("HERMES_CHAT_UPSTREAM", "").strip().rstrip("/")
-MAX_AUDIO_BYTES = int(os.environ.get("CERAP_AUDIO_MAX_BYTES", str(32 * 1024 * 1024)))
+MAX_AUDIO_BYTES = int(os.environ.get("HERMES_AUDIO_MAX_BYTES") or os.environ.get("CERAP_AUDIO_MAX_BYTES") or str(32 * 1024 * 1024))
 _AUDIO_CTYPE = {"mp3": "audio/mpeg", "opus": "audio/ogg", "ogg": "audio/ogg", "wav": "audio/wav", "flac": "audio/flac"}
 
 
@@ -73,9 +83,12 @@ def _load_api_key() -> str:
             return str(extra["key"]).strip()
     except Exception:  # pragma: no cover - best effort
         pass
-    bearer_file = Path(HERMES_AGENT_DIR).parent / "cerap-audio-sidecar" / ".bearer"
-    if bearer_file.is_file():
-        return bearer_file.read_text().strip()
+    # New dir first, then the old "cerap-audio-sidecar" dir — installs that wrote a key file before the
+    # rebrand keep resolving (else every request 503s "no API_SERVER_KEY").
+    for _name in ("hermes-audio-sidecar", "cerap-audio-sidecar"):
+        bearer_file = Path(HERMES_AGENT_DIR).parent / _name / ".bearer"
+        if bearer_file.is_file():
+            return bearer_file.read_text().strip()
     return ""
 
 
@@ -127,8 +140,10 @@ async def auth_middleware(request: web.Request, handler):
 
 
 async def handle_health(request: web.Request) -> web.Response:
-    # `proxy` lets the EDITH installer tell an audio-only sidecar (Cerap's) from a chat-forwarding one.
-    return web.json_response({"ok": True, "service": "cerap-audio-sidecar", "proxy": bool(CHAT_UPSTREAM)})
+    # `ok` + `proxy` are the stable contract (the installer greps `"proxy":true` to tell an audio-only
+    # sidecar from a chat-forwarding one). Only the vanity `service` name is rebranded — no consumer
+    # keys off it (Cerap reaches the sidecar at a user-set base URL; the installer greps only `proxy`).
+    return web.json_response({"ok": True, "service": "hermes-audio-sidecar", "proxy": bool(CHAT_UPSTREAM)})
 
 
 async def handle_transcriptions(request: web.Request) -> web.Response:
@@ -207,7 +222,8 @@ async def handle_speech(request: web.Request) -> web.Response:
 
 # ── optional chat/text reverse-proxy (opt-in via HERMES_CHAT_UPSTREAM) ──────────────────────────
 # Forwards everything that isn't audio/health to the local Hermes api_server, so a single-URL client
-# can reach chat + audio through this one port. Additive + opt-in: Cerap never registers this route.
+# can reach chat + audio through this one port. Additive + opt-in: an audio-only client (e.g. Cerap)
+# never registers this route.
 _HOP = {"host", "content-length", "connection", "keep-alive", "transfer-encoding", "te",
         "trailer", "upgrade", "proxy-authorization", "proxy-authenticate", "content-encoding"}
 
@@ -275,5 +291,5 @@ if __name__ == "__main__":
         log.warning("No API_SERVER_KEY resolved — every request will 503 until one is set.")
     if CHAT_UPSTREAM:
         log.info("chat reverse-proxy ON — non-audio requests forward to %s", CHAT_UPSTREAM)
-    log.info("cerap-audio-sidecar listening on 0.0.0.0:%d (hermes-agent=%s)", PORT, HERMES_AGENT_DIR)
-    web.run_app(make_app(), host="0.0.0.0", port=PORT, print=None)
+    log.info("hermes-audio-sidecar listening on %s:%d (hermes-agent=%s)", BIND, PORT, HERMES_AGENT_DIR)
+    web.run_app(make_app(), host=BIND, port=PORT, print=None)

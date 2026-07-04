@@ -8,6 +8,9 @@ reuses Hermes's *own* STT engine and exposes it over HTTP, and forwards everythi
 EDITH reaches **chat + voice through one URL**. It runs on *your* machine; **audio never leaves it**,
 and it uses your own provider, so it costs nothing to run.
 
+> It's a **universal Hermes access shim**, not an EDITH-only thing — any client (EDITH, Cerap, or your
+> own app) can point at it. This repo is just the EDITH-flavored one-line installer for it.
+
 ## Install — one line
 
 On the machine that runs your Hermes:
@@ -62,9 +65,14 @@ to override defaults.
 
 ## Security
 
-Audited (see `SECURITY.md`): no remotely-exploitable bug — every route is token-gated. Do:
-- **Front it with a network gate** (Tailscale, or Cloudflare Access / mTLS) rather than exposing a
-  bearer-only service on a raw public tunnel. The bearer alone has no rate-limit or lockout.
+Audited + red-teamed (see `SECURITY.md`): no remotely-exploitable bug — every route is token-gated,
+and the chat proxy is a **strict allowlist** (only `/v1/chat/completions` + `/v1/models` reach Hermes).
+Do:
+- **Front it with a network gate.** The installer detects **Tailscale** and prints the exact tailnet
+  URL to point EDITH at — that's the recommended path (only your tailnet can reach it, no config). For
+  public internet use **Cloudflare Access / mTLS**, not a bearer-only tunnel — the bearer alone has no
+  rate-limit or lockout. When fronted by a same-box tunnel, also set `HERMES_AUDIO_BIND=127.0.0.1` so
+  only the local tunnel can reach the sidecar (default is `0.0.0.0` because devices reach it remotely).
 - **Use a strong, ideally distinct key** — the sidecar shares your Hermes gateway key by default, so a
   leak is a whole-gateway leak; a separate rotatable token limits the blast radius.
 - Keep the proxy **off** if you don't need single-URL chat (audio-only still works).

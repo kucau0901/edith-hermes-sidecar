@@ -9,7 +9,8 @@
 # forwarding so EDITH reaches chat + voice through ONE URL. It never modifies Hermes itself.
 #
 # Overrides (env): HERMES_AGENT_DIR, HERMES_VENV_PY, HERMES_API_PORT (default 8642),
-#                  HERMES_AUDIO_PORT (default 8643), EDITH_AUDIO_BASE (where to fetch server.py).
+#                  HERMES_AUDIO_PORT (default 8643), HERMES_AUDIO_BIND (default 0.0.0.0 — narrow to
+#                  127.0.0.1 only if you front it with a same-box tunnel), EDITH_AUDIO_BASE (fetch base).
 set -euo pipefail
 
 # Where install.sh fetches server.py from — the same public repo it lives in (raw GitHub).
@@ -19,7 +20,7 @@ API_PORT="${HERMES_API_PORT:-8642}"
 UPSTREAM="http://127.0.0.1:${API_PORT}"
 HERMES_DIR="${HERMES_AGENT_DIR:-$HOME/.hermes/hermes-agent}"
 INSTALL_DIR="$HOME/.hermes/hermes-audio-sidecar"
-BEARER_DIR="$HOME/.hermes/cerap-audio-sidecar"   # where server.py looks for a .bearer fallback
+BEARER_DIR="$HOME/.hermes/hermes-audio-sidecar"  # .bearer fallback dir (server also reads the old cerap-audio-sidecar/)
 LABEL="com.edith.hermes-audio"
 LOG_DIR="$HOME/.hermes/logs"          # NOT world-readable /tmp — ~/.hermes is 0700
 LOG="$LOG_DIR/hermes-audio-sidecar.log"
@@ -39,7 +40,7 @@ if HEALTH="$(curl -fsS "http://localhost:$PORT/health" 2>/dev/null)"; then
     bold "Done. Point EDITH's Hermes URL at this box; see the exposure note at the end."
     exit 0
   fi
-  warn "A sidecar is running on :$PORT but chat-forwarding is OFF (looks like Cerap's audio-only one)."
+  warn "A sidecar is running on :$PORT but chat-forwarding is OFF (looks like an audio-only sidecar)."
   warn "EDITH needs chat-forwarding. Add this to that service's environment and restart it:"
   warn "    HERMES_CHAT_UPSTREAM=$UPSTREAM"
   die  "Refusing to start a second sidecar on the same port. Reconfigure the existing one, then re-run to verify."
@@ -113,7 +114,7 @@ if [ "$OS" = "Darwin" ]; then
   <key>WorkingDirectory</key><string>$HERMES_DIR</string>
   <key>EnvironmentVariables</key><dict>
     <key>HERMES_AGENT_DIR</key><string>$HERMES_DIR</string>
-    <key>CERAP_AUDIO_PORT</key><string>$PORT</string>
+    <key>HERMES_AUDIO_PORT</key><string>$PORT</string>
     <key>HERMES_CHAT_UPSTREAM</key><string>$UPSTREAM</string>
   </dict>
   <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
@@ -136,7 +137,7 @@ After=network.target
 [Service]
 WorkingDirectory=$HERMES_DIR
 Environment=HERMES_AGENT_DIR=$HERMES_DIR
-Environment=CERAP_AUDIO_PORT=$PORT
+Environment=HERMES_AUDIO_PORT=$PORT
 Environment=HERMES_CHAT_UPSTREAM=$UPSTREAM
 ExecStart=$VENV_PY $INSTALL_DIR/server.py
 Restart=always
@@ -172,23 +173,43 @@ done
 [ -n "$OK" ] || die "Sidecar did not come up chat-forwarding — check the log: $LOG"
 info "Sidecar is up on :$PORT with chat-forwarding ON ✓"
 
-# ── 7. Last step: expose it, then point EDITH at it ───────────────────────────────────────────────
+# ── 7. Last step: expose it SECURELY, then point EDITH at it ──────────────────────────────────────
 bold "Done — your Hermes now speaks EDITH."
+
+# Detect Tailscale so we can hand over the exact, already-authenticated URL.
+TS_IP="$(tailscale ip -4 2>/dev/null | head -1 || true)"
+TS_DNS="$(tailscale status --json 2>/dev/null | sed -n 's/.*"DNSName":"\([^"]*\)".*/\1/p' | head -1 | sed 's/\.$//' || true)"
+
 cat <<EOF
 
-  This one sidecar serves BOTH chat and voice, so EDITH needs just ONE URL — the sidecar's address:
+  This one sidecar serves BOTH chat and voice, so EDITH needs just ONE URL. Reach it over a network
+  that AUTHENTICATES the connection — the sidecar's bearer alone has no rate-limit or lockout, so
+  don't hang it off a raw public tunnel. In order of preference:
+EOF
+if [ -n "$TS_IP" ]; then
+  cat <<EOF
 
-  • Over Tailscale (simplest): point EDITH's Hermes URL at this box, e.g.
-        http://$(hostname 2>/dev/null || echo your-box):$PORT
-    Nothing else to configure.
+  ✅ Tailscale (recommended — detected on this box). Only your tailnet can reach it. Point EDITH at:
+        http://$TS_IP:$PORT${TS_DNS:+        (or  http://$TS_DNS:$PORT)}
+     Nothing else to configure. For TLS over the tailnet, optionally:  tailscale serve --bg $PORT
+EOF
+else
+  cat <<EOF
 
-  • Over the internet: expose port $PORT with your tunnel/proxy and use that HTTPS URL, e.g.
-        https://hermes.example.com   ->   http://localhost:$PORT
+  ✅ Tailscale (recommended). Install it here + on your phone; the tailnet authenticates the network
+     layer. Then point EDITH at  http://<this-box-tailscale-ip>:$PORT  — nothing else to configure.
+EOF
+fi
+cat <<EOF
+
+  ✅ Cloudflare Access / mTLS — if you MUST use the public internet, put it behind Access (identity +
+     logging + revocation), not a bearer-only tunnel:   https://hermes.example.com  ->  http://localhost:$PORT
+     Then narrow the sidecar so only the local tunnel can reach it: set  HERMES_AUDIO_BIND=127.0.0.1.
 
   Then in EDITH → Assistant → Hermes: paste the URL + your API key, pick "Hermes" as the chat brain,
   and tap Test.
 
-  (Already running Cerap on this box? Untouched — Cerap keeps routing its chat straight to :$API_PORT
-  and only uses the sidecar for audio; the chat-forwarding you just enabled is only used by clients
-  that point directly at :$PORT.)
+  (Already running Cerap or another client on this box? Untouched — this is a universal Hermes access
+  shim; existing clients that route chat straight to :$API_PORT keep working, and the chat-forwarding
+  you just enabled is only used by clients that point directly at :$PORT.)
 EOF
