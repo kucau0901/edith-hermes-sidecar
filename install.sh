@@ -147,7 +147,14 @@ EOF
   loginctl enable-linger "$(id -un)" 2>/dev/null || warn "Could not enable lingering — the sidecar may stop when you log out (run: sudo loginctl enable-linger $(id -un))."
   info "Enabled hermes-audio-sidecar.service"
 else
-  die "Unsupported OS: $OS. Run '$VENV_PY $INSTALL_DIR/server.py' yourself (see the sidecar README)."
+  case "$OS" in
+    MINGW*|MSYS*|CYGWIN*|Windows*)
+      die "Native Windows isn't supported yet. Run your Hermes AND this installer inside WSL (Ubuntu) —
+  there it installs as a normal Linux systemd service. (Or start it by hand:
+  '$VENV_PY $INSTALL_DIR/server.py'.)" ;;
+    *)
+      die "Unsupported OS: $OS (only macOS + Linux). Start it by hand: '$VENV_PY $INSTALL_DIR/server.py'." ;;
+  esac
 fi
 
 # ── 6. Verify ─────────────────────────────────────────────────────────────────────────────────────

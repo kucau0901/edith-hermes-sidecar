@@ -26,6 +26,16 @@ chat-forwarding. Re-running it is safe.
 - Your Hermes **API key** (the `api_server` bearer). The installer reuses it from `~/.hermes/config.yaml`;
   if it can't find one, it asks.
 
+## Supported systems + restarts
+
+| OS | Service | Survives a restart? |
+|---|---|---|
+| **macOS** | launchd LaunchAgent (`RunAtLoad` + `KeepAlive`) | Yes — restarts on crash, and comes back **at login** (same as Hermes itself; enable auto-login for a headless always-on Mac). |
+| **Linux** | `systemd --user` (`Restart=always`) + `loginctl enable-linger` | Yes — restarts on crash **and survives reboot headless** (no login needed). |
+| **Windows** | — | Not natively. Run Hermes + this installer **inside WSL** (it installs as a Linux service). |
+
+Runs it by hand instead: `HERMES_AGENT_DIR=~/.hermes/hermes-agent ~/.hermes/hermes-agent/venv/bin/python server.py`.
+
 ## Then, in EDITH
 
 **Assistant → Hermes**: enter the sidecar's **URL** + your **API key**, pick **Hermes** as the chat
