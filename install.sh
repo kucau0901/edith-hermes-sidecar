@@ -21,7 +21,9 @@ HERMES_DIR="${HERMES_AGENT_DIR:-$HOME/.hermes/hermes-agent}"
 INSTALL_DIR="$HOME/.hermes/hermes-audio-sidecar"
 BEARER_DIR="$HOME/.hermes/cerap-audio-sidecar"   # where server.py looks for a .bearer fallback
 LABEL="com.edith.hermes-audio"
-LOG="/tmp/hermes-audio-sidecar.log"
+LOG_DIR="$HOME/.hermes/logs"          # NOT world-readable /tmp — ~/.hermes is 0700
+LOG="$LOG_DIR/hermes-audio-sidecar.log"
+AIOHTTP_PIN="aiohttp==3.13.4"         # pinned for reproducible/auditable installs (bump deliberately)
 
 bold() { printf '\n\033[1m%s\033[0m\n' "$*"; }
 info() { printf '  %s\n' "$*"; }
@@ -57,7 +59,8 @@ info "STT engine imports OK"
 
 # ── 2. The one missing dependency ─────────────────────────────────────────────────────────────────
 bold "Installing dependency (aiohttp) into the Hermes venv"
-"$VENV_PY" -m pip install --quiet --disable-pip-version-check aiohttp || die "pip install aiohttp failed."
+mkdir -p "$LOG_DIR"; chmod 700 "$LOG_DIR" 2>/dev/null || true
+"$VENV_PY" -m pip install --quiet --disable-pip-version-check "$AIOHTTP_PIN" || die "pip install $AIOHTTP_PIN failed."
 info "ok"
 
 # ── 3. Fetch the sidecar ──────────────────────────────────────────────────────────────────────────
@@ -88,7 +91,7 @@ else
   printf '  Enter your Hermes API_SERVER_KEY (the bearer token): '
   read -r KEY < /dev/tty
   [ -n "$KEY" ] || die "A key is required."
-  mkdir -p "$BEARER_DIR"
+  mkdir -p "$BEARER_DIR"; chmod 700 "$BEARER_DIR" 2>/dev/null || true
   printf '%s' "$KEY" > "$BEARER_DIR/.bearer"
   chmod 600 "$BEARER_DIR/.bearer"
   info "Saved to $BEARER_DIR/.bearer (0600)."

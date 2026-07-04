@@ -86,15 +86,40 @@ def _err(message: str, status: int, code: str = "invalid_request_error") -> web.
     return web.json_response({"error": {"message": message, "type": code}}, status=status)
 
 
+# CORS — EDITH runs inside the Even app's WebView and fetches this cross-origin, so preflights must be
+# answered HERE (not forwarded) and responses must carry the headers. The bearer travels in the
+# Authorization HEADER (not a cookie), so "*" is safe — it never weakens the token gate; a caller
+# still needs the key for any real request. Answering OPTIONS here also closes the old gap where an
+# unauthenticated OPTIONS reached the proxy/upstream.
+_CORS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Authorization, Content-Type",
+    "Access-Control-Max-Age": "600",
+}
+
+
+@web.middleware
+async def cors_middleware(request: web.Request, handler):
+    if request.method == "OPTIONS":
+        return web.Response(status=204, headers=_CORS)  # preflight — never auth, never proxy
+    resp = await handler(request)
+    if not resp.prepared:  # a streamed proxy response sets CORS itself before prepare()
+        for k, v in _CORS.items():
+            resp.headers.setdefault(k, v)
+    return resp
+
+
 @web.middleware
 async def auth_middleware(request: web.Request, handler):
-    if request.method == "OPTIONS" or request.path == "/health":
+    if request.path == "/health":
         return await handler(request)
     if not API_KEY:
         return _err("sidecar misconfigured: no API_SERVER_KEY", 503, "server_error")
     header = request.headers.get("Authorization", "")
     if header.startswith("Bearer ") and hmac.compare_digest(header[7:].strip(), API_KEY):
         return await handler(request)
+    log.warning("auth failure: %s %s from %s", request.method, request.path, request.remote)  # detection
     return web.json_response(
         {"error": {"message": "Invalid API key", "type": "invalid_request_error", "code": "invalid_api_key"}},
         status=401,
@@ -196,9 +221,17 @@ async def handle_proxy(request: web.Request) -> web.StreamResponse:
         async with session.request(
             request.method, target, headers=headers, data=body, allow_redirects=False,
         ) as up:
-            data = await up.read()  # session auto-decompresses; we strip content-encoding via _HOP
-            out = {k: v for k, v in up.headers.items() if k.lower() not in _HOP}
-            return web.Response(status=up.status, body=data, headers=out)
+            # STREAM the upstream response chunk-by-chunk so SSE (token-by-token chat) survives and a
+            # long generation keeps emitting bytes (no Cloudflare 524, no whole-body buffering in RAM).
+            out = {k: v for k, v in up.headers.items() if k.lower() not in _HOP}  # drops content-length/encoding
+            resp = web.StreamResponse(status=up.status, headers=out)
+            for k, v in _CORS.items():
+                resp.headers.setdefault(k, v)
+            await resp.prepare(request)
+            async for chunk in up.content.iter_any():  # auto-decompressed chunks
+                await resp.write(chunk)
+            await resp.write_eof()
+            return resp
     except aiohttp.ClientError as e:
         return _err(f"upstream unreachable: {type(e).__name__}", 502, "server_error")
 
@@ -211,16 +244,28 @@ async def _close_session(app: web.Application) -> None:
     await app["proxy_session"].close()
 
 
+# Only these paths are proxied to Hermes — an explicit allowlist, NOT a catch-all, so the sidecar
+# never fronts the rest of the api_server (agent/jobs/cron/file routes = RCE-as-host-user). Extend
+# deliberately if a client genuinely needs more.
+PROXY_ALLOWLIST = (
+    ("POST", "/v1/chat/completions"),
+    ("GET", "/v1/models"),
+)
+
+
 def make_app() -> web.Application:
-    app = web.Application(middlewares=[auth_middleware], client_max_size=MAX_AUDIO_BYTES + 1024 * 1024)
+    app = web.Application(
+        middlewares=[cors_middleware, auth_middleware],  # cors first: answers OPTIONS before auth
+        client_max_size=MAX_AUDIO_BYTES + 1024 * 1024,
+    )
     app.router.add_get("/health", handle_health)
     app.router.add_post("/v1/audio/transcriptions", handle_transcriptions)
     app.router.add_post("/v1/audio/speech", handle_speech)
     if CHAT_UPSTREAM:
-        # Registered LAST so the specific audio/health routes win; the catch-all takes everything else.
         app.on_startup.append(_open_session)
         app.on_cleanup.append(_close_session)
-        app.router.add_route("*", "/{tail:.*}", handle_proxy)
+        for method, path in PROXY_ALLOWLIST:  # scoped proxy — everything else 404s
+            app.router.add_route(method, path, handle_proxy)
     return app
 
 

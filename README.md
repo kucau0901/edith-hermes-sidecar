@@ -41,20 +41,33 @@ Runs it by hand instead: `HERMES_AGENT_DIR=~/.hermes/hermes-agent ~/.hermes/herm
 **Assistant → Hermes**: enter the sidecar's **URL** + your **API key**, pick **Hermes** as the chat
 brain, and tap **Test**.
 
-- Over **Tailscale** (simplest): `http://<this-box>:8643`
-- Over the **internet**: expose port `8643` with your tunnel/reverse-proxy and use that HTTPS URL.
+- Over **Tailscale** (recommended): `http://<this-box>:8643` — the tailnet authenticates the network
+  layer, so your key isn't the *only* thing standing between the internet and your Hermes.
+- Over the **internet**: put it behind **Cloudflare Access / mTLS** (identity + per-request logging +
+  revocation), not a raw bearer-only tunnel. See **Security** below.
 
 ## What it exposes
 
 | Method | Path | Purpose |
 |---|---|---|
+| `GET` | `/health` | liveness — the only unauthenticated route |
 | `POST` | `/v1/audio/transcriptions` | speech-to-text (reuses Hermes's engine) |
-| `*` | anything else | forwarded to your Hermes (`:8642`) — chat, models, … |
-| `GET` | `/health` | liveness (the only unauthenticated route) |
+| `POST`/`GET` | `/v1/chat/completions`, `/v1/models` | forwarded to your Hermes (`:8642`) |
 
-Bearer-auth on every route except `/health` (same key as your Hermes). It makes **no outbound calls
-to user-supplied URLs** (no SSRF surface). Set `HERMES_API_PORT` / `HERMES_AUDIO_PORT` /
-`HERMES_AGENT_DIR` to override defaults.
+Bearer-auth (constant-time) on every route except `/health`. The proxy is a **strict allowlist** — it
+forwards ONLY the two chat paths above, so the rest of the Hermes api_server (agent/jobs/cron/file
+routes) is **not** reachable through the sidecar. No outbound calls to user-supplied URLs (no SSRF).
+CORS preflights are answered locally. Set `HERMES_API_PORT` / `HERMES_AUDIO_PORT` / `HERMES_AGENT_DIR`
+to override defaults.
+
+## Security
+
+Audited (see `SECURITY.md`): no remotely-exploitable bug — every route is token-gated. Do:
+- **Front it with a network gate** (Tailscale, or Cloudflare Access / mTLS) rather than exposing a
+  bearer-only service on a raw public tunnel. The bearer alone has no rate-limit or lockout.
+- **Use a strong, ideally distinct key** — the sidecar shares your Hermes gateway key by default, so a
+  leak is a whole-gateway leak; a separate rotatable token limits the blast radius.
+- Keep the proxy **off** if you don't need single-URL chat (audio-only still works).
 
 ## Uninstall
 
