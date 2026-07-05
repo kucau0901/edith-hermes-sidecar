@@ -107,7 +107,7 @@ def _err(message: str, status: int, code: str = "invalid_request_error") -> web.
 _CORS = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Authorization, Content-Type",
+    "Access-Control-Allow-Headers": "Authorization, Content-Type, X-Hermes-Session-Key",
     "Access-Control-Max-Age": "600",
 }
 
@@ -226,13 +226,19 @@ async def handle_speech(request: web.Request) -> web.Response:
 # never registers this route.
 _HOP = {"host", "content-length", "connection", "keep-alive", "transfer-encoding", "te",
         "trailer", "upgrade", "proxy-authorization", "proxy-authenticate", "content-encoding"}
+# Also drop the browser's Origin/Referer when forwarding UPSTREAM. Hermes' api_server 403s any request
+# that carries an Origin (a CSRF / DNS-rebind defense), but EDITH runs inside the Even app's WebView,
+# so every fetch carries one — which killed the whole chat path from the glasses with 403. The sidecar
+# already terminates CORS itself (Access-Control-Allow-Origin: * above), so Hermes must see a clean
+# server-to-server request without these browser headers.
+_STRIP_UPSTREAM = _HOP | {"origin", "referer"}
 
 
 async def handle_proxy(request: web.Request) -> web.StreamResponse:
     session: aiohttp.ClientSession = request.app["proxy_session"]
     target = CHAT_UPSTREAM + request.rel_url.raw_path_qs
     body = await request.read()
-    headers = {k: v for k, v in request.headers.items() if k.lower() not in _HOP}
+    headers = {k: v for k, v in request.headers.items() if k.lower() not in _STRIP_UPSTREAM}
     try:
         async with session.request(
             request.method, target, headers=headers, data=body, allow_redirects=False,
